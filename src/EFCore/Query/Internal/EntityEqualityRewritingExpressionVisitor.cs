@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
 
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
@@ -242,6 +243,15 @@ namespace Microsoft.EntityFrameworkCore.Query.Internal
                 }
             }
 
+            // We handled the Contains extension method above, but there's also List.Contains and potentially others on ICollection
+            if (methodCallExpression.Method.Name == "Contains"
+                && methodCallExpression.Method.ReturnType == typeof(bool)
+                && methodCallExpression.Arguments.Count == 1
+                && methodCallExpression.Object?.Type.TryGetSequenceType() == methodCallExpression.Arguments[0].Type)
+            {
+                return VisitContainsMethodCall(methodCallExpression);
+            }
+
             // TODO: Can add an extension point that can be overridden by subclassing visitors to recognize additional methods and flow through the entity type.
             // Do this here, since below we visit the arguments (avoid double visitation)
 
@@ -313,16 +323,18 @@ namespace Microsoft.EntityFrameworkCore.Query.Internal
 
         protected virtual Expression VisitContainsMethodCall(MethodCallExpression methodCallExpression)
         {
-            var arguments = methodCallExpression.Arguments;
-            var newSource = Visit(arguments[0]);
-            var newItem = Visit(arguments[1]);
+            // We handle both Contains the extension method and the instance method
+            var (newSource, newItem) = methodCallExpression.Arguments.Count == 2
+                ? (methodCallExpression.Arguments[0], methodCallExpression.Arguments[1])
+                : (methodCallExpression.Object, methodCallExpression.Arguments[0]);
+            (newSource, newItem) = (Visit(newSource), Visit(newItem));
 
             var sourceEntityType = (newSource as EntityReferenceExpression)?.EntityType;
             var itemEntityType = (newItem as EntityReferenceExpression)?.EntityType;
 
             if (sourceEntityType == null && itemEntityType == null)
             {
-                return methodCallExpression.Update(null, new[] { newSource, newItem });
+                return NoTranslation();
             }
 
             if (sourceEntityType != null && itemEntityType != null
@@ -335,27 +347,74 @@ namespace Microsoft.EntityFrameworkCore.Query.Internal
             var entityType = sourceEntityType ?? itemEntityType;
 
             var keyProperties = entityType.FindPrimaryKey().Properties;
-            var keyProperty = keyProperties.Count == 1
-                ? keyProperties.Single()
-                : throw new NotSupportedException(CoreStrings.EntityEqualityContainsWithCompositeKeyNotSupported(entityType.DisplayName()));
+            if (keyProperties.Count > 1)
+            {
+                // We usually throw on composite keys, but here specifically we don't, since the construct Any(Contains()) can be translated
+                // without any key rewriting (see test Where_contains_on_navigation_with_composite_keys).
+                // This is currently done by nav expansion so we let the expression through.
+                return NoTranslation();
+            }
+            var keyProperty = keyProperties.Single();
 
-            // Wrap the source with a projection to its primary key, and the item with a primary key access expression
-            var param = Expression.Parameter(entityType.ClrType, "v");
-            var keySelector = Expression.Lambda(CreatePropertyAccessExpression(param, keyProperty), param);
-            var keyProjection = Expression.Call(
-                LinqMethodHelpers.QueryableSelectMethodInfo.MakeGenericMethod(entityType.ClrType, keyProperty.ClrType),
-                Unwrap(newSource),
-                keySelector);
+            Expression rewrittenSource, rewrittenItem;
 
-            var rewrittenItem = newItem.IsNullConstantExpression()
+            if (newSource is ConstantExpression listConstant)
+            {
+                // The source list is a constant, evaluate and replace with a list of the keys
+                var listValue = (IEnumerable)listConstant.Value;
+                var keyListType = typeof(List<>).MakeGenericType(keyProperty.ClrType);
+                var keyList = (IList)Activator.CreateInstance(keyListType);
+                foreach (var listItem in listValue)
+                {
+                    keyList.Add(keyProperty.GetGetter().GetClrValue(listItem));
+                }
+                rewrittenSource = Expression.Constant(keyList, keyListType);
+            }
+            else if (newSource is ParameterExpression listParam && listParam.IsQueryParam())
+            {
+                // The source list is a parameter. Add a runtime parameter that will contain a list of the extracted keys for each execution.
+                var lambda = Expression.Lambda(
+                    Expression.Call(
+                        _parameterListValueExtractor,
+                        QueryCompilationContext.QueryContextParameter,
+                        Expression.Constant(listParam.Name, typeof(string)),
+                        Expression.Constant(keyProperty, typeof(IProperty))),
+                    QueryCompilationContext.QueryContextParameter
+                );
+
+                var newParameterName = $"{RuntimeParameterPrefix}{listParam.Name.Substring(CompiledQueryCache.CompiledQueryParameterPrefix.Length)}_{keyProperty.Name}";
+                _queryCompilationContext.RegisterRuntimeParameter(newParameterName, lambda);
+                rewrittenSource = Expression.Parameter(typeof(List<>).MakeGenericType(keyProperty.ClrType), newParameterName);
+            }
+            else
+            {
+                // The source list is neither a constant nor a parameter. Wrap it with a projection to its primary key.
+                var param = Expression.Parameter(entityType.ClrType, "v");
+                var keySelector = Expression.Lambda(CreatePropertyAccessExpression(param, keyProperty), param);
+                rewrittenSource = Expression.Call(
+                    (Unwrap(newSource).Type.IsQueryableType()
+                        ? LinqMethodHelpers.QueryableSelectMethodInfo
+                        : LinqMethodHelpers.EnumerableSelectMethodInfo).MakeGenericMethod(entityType.ClrType, keyProperty.ClrType),
+                    Unwrap(newSource),
+                    keySelector);
+            }
+
+            // Rewrite the item with a key expression as needed (constant, parameter and other are handled within)
+            rewrittenItem = newItem.IsNullConstantExpression()
                 ? Expression.Constant(null)
                 : CreatePropertyAccessExpression(Unwrap(newItem), keyProperty);
 
             return Expression.Call(
-                LinqMethodHelpers.QueryableContainsMethodInfo.MakeGenericMethod(keyProperty.ClrType),
-                keyProjection,
+                (Unwrap(newSource).Type.IsQueryableType()
+                    ? LinqMethodHelpers.QueryableContainsMethodInfo
+                    : LinqMethodHelpers.EnumerableContainsMethodInfo).MakeGenericMethod(keyProperty.ClrType),
+                rewrittenSource,
                 rewrittenItem
             );
+
+            Expression NoTranslation() => methodCallExpression.Arguments.Count == 2
+                ? methodCallExpression.Update(null, new[] { Unwrap(newSource), Unwrap(newItem) })
+                : methodCallExpression.Update(Unwrap(newSource), new[] { Unwrap(newItem) });
         }
 
         protected virtual Expression VisitOrderingMethodCall(MethodCallExpression methodCallExpression)
@@ -787,8 +846,7 @@ namespace Microsoft.EntityFrameworkCore.Query.Internal
 
             // If the target is a query parameter, we can't simply add a property access over it, but must instead cause a new
             // parameter to be added at runtime, with the value of the property on the base parameter.
-            if (target is ParameterExpression baseParameterExpression
-                && baseParameterExpression.Name.StartsWith(CompiledQueryCache.CompiledQueryParameterPrefix, StringComparison.Ordinal))
+            if (target is ParameterExpression baseParameterExpression && baseParameterExpression.IsQueryParam())
             {
                 // Generate an expression to get the base parameter from the query context's parameter list, and extract the
                 // property from that
@@ -820,6 +878,31 @@ namespace Microsoft.EntityFrameworkCore.Query.Internal
                 = typeof(EntityEqualityRewritingExpressionVisitor)
                     .GetTypeInfo()
                     .GetDeclaredMethod(nameof(ParameterValueExtractor));
+
+        /// <summary>
+        /// Extracts the list parameter with name <paramref name="baseParameterName"/> from <paramref name="context"/> and returns a
+        /// projection to its elements' <paramref name="property"/> values.
+        /// </summary>
+        private static object ParameterListValueExtractor(QueryContext context, string baseParameterName, IProperty property)
+        {
+            var baseListParameter = (IEnumerable)context.ParameterValues[baseParameterName];
+            if (baseListParameter == null)
+            {
+                return null;
+            }
+            var keyListType = typeof(List<>).MakeGenericType(property.ClrType);
+            var keyList = (IList)Activator.CreateInstance(keyListType);
+            foreach (var listItem in baseListParameter)
+            {
+                keyList.Add(property.GetGetter().GetClrValue(listItem));
+            }
+            return keyList;
+        }
+
+        private static readonly MethodInfo _parameterListValueExtractor
+            = typeof(EntityEqualityRewritingExpressionVisitor)
+                .GetTypeInfo()
+                .GetDeclaredMethod(nameof(ParameterListValueExtractor));
 
         protected static Expression UnwrapLastNavigation(Expression expression)
             => (expression as MemberExpression)?.Expression
